@@ -1,18 +1,16 @@
-# KISS SHRED 2.0 — fatloss.py (Reorganized UI + Phase 2 Upgrades)
-# Mobile-first fat-loss coach...
-import os, sqlite3, json, datetime, re, uuid, random, math
+# KISS SHRED 2.2 — fatloss.py (Final Full App)
+# See header comments for features & deploy notes.
+
+import os, sqlite3, json, datetime, re, uuid, random, math, sys
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Any
+from typing import Tuple, Any, Dict, List
+
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-
-# ----------------------------
-# App/Paths
-# ----------------------------
-APP_NAME = "KISS SHRED 2.1"
+APP_NAME = "KISS SHRED 2.2"
 DB_FILE = "kiss_shred.db"
 ROOT = Path.cwd()
 PHOTOS_DIR = ROOT / "photos"
@@ -26,20 +24,21 @@ st.set_page_config(page_title=APP_NAME, page_icon="🔥", layout="centered")
 st.markdown(
     """
     <style>
-      .block-container{padding-top:1rem; padding-bottom:5.5rem;}
+      .block-container{padding-top:1rem; padding-bottom:5.5rem; max-width: 760px;}
       .sticky-bottom{position:fixed; bottom:0; left:0; right:0; background:#0f0f0f; padding:.5rem 1rem; border-top:1px solid #333;}
       .journey {border:1px solid #222;border-radius:12px;padding:10px;margin:.5rem 0;background:#0e0e0e}
       .journey span{display:inline-block;margin-right:8px;padding:4px 8px;border-radius:999px;border:1px solid #333}
       .active{background:#22c55e22;border-color:#22c55e;color:#a7f3d0}
       .muted{color:#aaa;}
+      .badge{display:inline-block; padding:4px 8px; border:1px solid #333; border-radius:999px; margin-right:6px; font-size:12px}
+      .good{background:#22c55e22; border-color:#22c55e;}
+      .warn{background:#f59e0b22; border-color:#f59e0b;}
+      .bad{background:#ef444422; border-color:#ef4444;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ----------------------------
-# DB helpers
-# ----------------------------
 def get_conn():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
@@ -61,23 +60,35 @@ def get_conn():
     c.execute("""CREATE TABLE IF NOT EXISTS body_measurements(dt TEXT, waist_in REAL, chest_in REAL, hip_in REAL, thigh_in REAL, arm_in REAL, neck_in REAL, notes TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS pr_log(dt TEXT, env TEXT, system TEXT, lift TEXT, reps INT, load_lbs REAL, notes TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS photos(dt TEXT, view TEXT, filename TEXT, note TEXT)""")
-    # sessions
     c.execute("""CREATE TABLE IF NOT EXISTS workout_sessions(
         session_id TEXT PRIMARY KEY, dt TEXT, start_ts TEXT, end_ts TEXT, duration_min INT,
         env TEXT, system TEXT, phase TEXT, day_name TEXT, perceived_effort INT, notes TEXT
     )""")
-    # sets
     c.execute("""CREATE TABLE IF NOT EXISTS sets_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT, dt TEXT, session_id TEXT, exercise TEXT,
         load_lbs REAL, reps INT, rpe REAL, volume REAL, rest_sec INT, pr_flag INT DEFAULT 0, notes TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS meal_prefs(
+        id INTEGER PRIMARY KEY, plan TEXT, dislikes TEXT, allergies TEXT, kcal_target INT, protein_target INT
     )""")
     conn.commit()
     return conn
 
 conn = get_conn()
 
-def q(sql, params=()): return pd.read_sql_query(sql, conn, params=params)
-def exec_i(sql, params=()): conn.execute(sql, params); conn.commit()
+def q(sql, params=()): 
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    except Exception as e:
+        st.error(f"DB query failed: {e}")
+        return pd.DataFrame()
+
+def exec_i(sql, params=()):
+    try:
+        conn.execute(sql, params); conn.commit()
+    except Exception as e:
+        st.error(f"DB exec failed: {e}")
+
 def set_kv(k,v): exec_i("INSERT OR REPLACE INTO settings(key,val) VALUES(?,?)",(k,json.dumps(v)))
 def get_kv(k, default=None):
     row = conn.execute("SELECT val FROM settings WHERE key=?", (k,)).fetchone()
@@ -88,27 +99,43 @@ def get_kv(k, default=None):
 today = lambda: datetime.date.today()
 today_str = lambda: today().isoformat()
 
-# ----------------------------
-# Defaults & boot
-# ----------------------------
 DEFAULTS = {
     "profile": {
-        "name":"Smooth","height_in":74,"sex":"M","age":35,
-        "start_wt":300.0,"goal_wt":230.0,"protein_g":220,"steps":9000,
-        "session_minutes":75,"env":"Gym","basketball_sun":True,
-        "basketball_time":"08:00-11:00",
-        "start_date": today_str(), "auto_phase": True,
+        "name": "Smooth",
+        "height_in": 74,
+        "sex": "M",
+        "age": 35,
+        "start_wt": 300.0,
+        "goal_wt": 230.0,
+        "protein_g": 220,
+        "steps": 9000,
+        "session_minutes": 75,
+        "env": "Gym",
+        "basketball_sun": True,
+        "basketball_time": "08:00-11:00",
+        "start_date": today_str(),
+        "auto_phase": True,
         "sound_ping": True,
-        # Auto Macros
         "cal_target": 2600,
         "auto_macro_adjust": True,
-        "macro_anchor_wt": 300.0
+        "macro_anchor_wt": 300.0,
+
+        # 🔥 NEW meal personalization fields
+        "lifestyle": "Mediterranean Reset",   # or: Pescatarian Flow, Power Build, Gastritis Gentle, Low-Carb Shred, Paleo Core
+        "dislikes": ["spinach"],              # user food dislikes
+        "allergies": [],                      # e.g., ["eggs", "shellfish"]
+        "cook_time_cap": 25,                  # max minutes they'll cook
+        "kitchen_access": "Full",             # "Full", "Microwave", "No-Cook"
     },
+
     "performance_mode": True,
-    "nav":"Today",
-    "system":"Linear",
-    "phase":"M1-3"
+    "nav": "Today",
+    "system": "Linear",
+    "phase": "M1-3"
 }
+
+
+
 if get_kv("_init") is None:
     for k,v in DEFAULTS.items(): set_kv(k,v)
     set_kv("_init", True)
@@ -116,9 +143,6 @@ if get_kv("_init") is None:
 for k,v in DEFAULTS.items():
     if k not in st.session_state: st.session_state[k]=get_kv(k,v)
 
-# ----------------------------
-# Library seeds
-# ----------------------------
 EX = {
     "Leg Press":{"env":"Gym","area":"Lower"}, "Hack Squat":{"env":"Gym","area":"Lower"},
     "Seated Ham Curl":{"env":"Gym","area":"Lower"}, "Leg Extension":{"env":"Gym","area":"Lower"},
@@ -133,14 +157,12 @@ EX = {
     "Stir-the-Pot":{"env":"Both","area":"Core"},
     "Assault Bike":{"env":"Gym","area":"Conditioning"}, "Elliptical":{"env":"Both","area":"Conditioning"},
     "Treadmill Walk":{"env":"Both","area":"Conditioning"}, "Basketball":{"env":"Both","area":"Conditioning"},
-    # Hotel DB
     "DB Goblet Squat":{"env":"Hotel","area":"Lower"}, "DB Split Squat":{"env":"Hotel","area":"Lower"},
     "DB Bench Press":{"env":"Hotel","area":"Push"}, "DB Shoulder Press":{"env":"Hotel","area":"Push"},
     "DB Row":{"env":"Hotel","area":"Pull"}, "Band Face Pull":{"env":"Hotel","area":"Pull"},
     "DB Rear Delt":{"env":"Hotel","area":"Pull"}, "Push-up":{"env":"Hotel","area":"Push"},
     "DB Calf Raise":{"env":"Hotel","area":"Lower"}
 }
-
 SWAPS = {
     "Hack Squat":["Leg Press","DB Goblet Squat"],
     "Seated Ham Curl":["DB RDL","Seated Ham Curl"],
@@ -148,7 +170,6 @@ SWAPS = {
     "Cable Fly":["Cable Fly","DB Bench Press"],
     "Seated Row":["DB Row","Seated Row"]
 }
-
 MEALS = {
     "Fast Food":[
         ("Chipotle Chicken Bowl (dbl chicken, fajita veg, salsa)",60,700,"No sour cream","Chipotle"),
@@ -163,6 +184,7 @@ MEALS = {
         ("Chicken, Rice, Veg",50,650,"Staple bowl","Home"),
         ("Greek Yogurt Parfait",30,320,"Low-acid","Home"),
         ("Salmon + Sweet Potato",45,600,"Recovery dinner","Home"),
+        ("Big-Ass Salad (chicken, greens, olive oil)",45,520,"Mediterranean-ish","Home"),
     ],
     "Hotel":[
         ("RTD Shake + Rice Cup",40,420,"Travel kit","Hotel"),
@@ -174,9 +196,6 @@ MEALS = {
 (MEALS_DIR/"meals.json").write_text(json.dumps(MEALS, indent=2))
 (PROGRAMS_DIR/"swaps.json").write_text(json.dumps(SWAPS, indent=2))
 
-# ----------------------------
-# Templates (Systems)
-# ----------------------------
 @dataclass
 class Block:
     ex: str; sets: int; reps: str; rpe: str="7-8"; note: str=""
@@ -221,7 +240,6 @@ LINEAR_GYM = SystemTemplate(
     ],
     time_crunch_trim=["Cable Fly","Rear Delt Fly","Hip Abductor","Calf Raise"]
 )
-
 LINEAR_HOTEL = SystemTemplate(
     "Linear","Hotel","M1-3",60,"Double progression; DB focus",
     days=[
@@ -243,7 +261,6 @@ LINEAR_HOTEL = SystemTemplate(
     ],
     time_crunch_trim=["DB Rear Delt","DB Calf Raise"]
 )
-
 POWERBUILD_GYM = SystemTemplate(
     "PowerBuild","Gym","M4-6",75,"Main 4x4–6 heavy + accessories 3x8–12",
     days=[
@@ -254,7 +271,6 @@ POWERBUILD_GYM = SystemTemplate(
     ],
     time_crunch_trim=["Rear Delt Fly","Hip Abductor","Calf Raise"]
 )
-
 METCON_GYM = SystemTemplate(
     "MetCon","Gym","M7-9",60,"Superset strength + cardio; short rests",
     days=[
@@ -263,7 +279,6 @@ METCON_GYM = SystemTemplate(
     ],
     time_crunch_trim=["Rear Delt Fly","Calf Raise"]
 )
-
 ATHLETIC_GYM = SystemTemplate(
     "Athletic","Gym","M10-12",75,"Explosive strength + skills (Sun basketball)",
     days=[
@@ -273,7 +288,6 @@ ATHLETIC_GYM = SystemTemplate(
     ],
     time_crunch_trim=["Rear Delt Fly","Hip Abductor","Calf Raise"]
 )
-
 SYSTEMS = {
     "Linear":{"Gym":LINEAR_GYM,"Hotel":LINEAR_HOTEL},
     "PowerBuild":{"Gym":POWERBUILD_GYM,"Hotel":LINEAR_HOTEL},
@@ -282,9 +296,6 @@ SYSTEMS = {
 }
 def get_system(name, env): return SYSTEMS.get(name,{}).get(env)
 
-# ----------------------------
-# Auto-phase + Journey
-# ----------------------------
 PHASE_FLOW = [("M1-3","Linear"),("M4-6","PowerBuild"),("M7-9","MetCon"),("M10-12","Athletic")]
 def months_since_start(iso): 
     try: start = datetime.date.fromisoformat(iso)
@@ -294,18 +305,10 @@ def current_phase_and_system(profile:dict):
     m = months_since_start(profile.get("start_date", today_str()))
     idx = min(len(PHASE_FLOW)-1, m//3)
     return PHASE_FLOW[idx]
-
 def journey_map_html(active_idx:int):
     labels=["Linear","PowerBuild","MetCon","Athletic"]
     chips=[f"<span class='{'active' if i==active_idx else ''}'>{lbl}</span>" for i,lbl in enumerate(labels)]
     return "<div class='journey'><b>Your 12-Month Shred Roadmap:</b> "+ " ".join(chips) +"</div>"
-
-# ----------------------------
-# Populate helpers
-# ----------------------------
-@dataclass
-class _DF:  # small utility
-    data: Any
 
 def _blocks_to_df(day: DayTemplate):
     rows=[{"Exercise":b.ex,"Sets":b.sets,"Reps":b.reps,"RPE":b.rpe,"Note":b.note} for b in day.blocks]
@@ -328,9 +331,6 @@ def populate_workout_for(date_str: str, env: str, system_name: str, day_obj: Day
         exec_i("INSERT INTO cardio_log(dt, mode, minutes, details) VALUES(?,?,?,?)",
                (date_str, mode, int(mins), f"From {system_name} {day_obj.name}"))
 
-# ----------------------------
-# Coach Brain (incl. Auto Macros)
-# ----------------------------
 def _last_n_days(n=14):
     base=today(); return [(base-datetime.timedelta(days=i)).isoformat() for i in range(n)][::-1]
 
@@ -346,10 +346,219 @@ def coach_insights():
     outs=[detect_weight_plateau()]
     tips=["Hit protein early.","Short rests, clean reps.","Add 1k steps.","Hydrate 16–24 oz pre-gym.","Pick a fast-food fallback."]
     outs.append({"type":"tip","msg":random.choice(tips)})
+    since7=(today()-datetime.timedelta(days=7)).isoformat()
+    prs=q("SELECT COUNT(*) as c FROM pr_log WHERE dt>=?",(since7,))
+    prc=int(prs['c'].iloc[0]) if not prs.empty else 0
+    if prc>=3: outs.append({"type":"badge","msg":"PR Hunter (3+ this week)"})
+    w5=q("SELECT COUNT(*) as c FROM weight_log WHERE dt>=?",((today()-datetime.timedelta(days=5)).isoformat(),))
+    wc=int(w5['c'].iloc[0]) if not w5.empty else 0
+    if wc>=5: outs.append({"type":"badge","msg":"Scale Streak (5-day)"})
     return [o for o in outs if o]
 
+# ----------------------------
+# AutoMeal Engine (50+ meals/lifestyle via smart generators)
+# ----------------------------
+LIFESTYLES = [
+    "Power Build","Mediterranean Reset","Pescatarian Flow",
+    "Gastritis Gentle","Low-Carb Shred","Paleo Core"
+]
+
+def _contains_any(text, words):
+    t = text.lower()
+    for w in words or []:
+        if w.strip().lower() in t:
+            return True
+    return False
+
+def _fits_tools(meal, kitchen_access):
+    tool = meal.get("tool","Full")
+    if kitchen_access == "Full": return True
+    if kitchen_access == "Microwave": return tool in ["Microwave","No-Cook"]
+    if kitchen_access == "No-Cook": return tool == "No-Cook"
+    return True
+
+def _approx_kcal(p, c, f):  # basic macro → kcal
+    return int(p*4 + c*4 + f*9)
+
+def _mk(meal, p, c, f, cat, tool, notes="", tags=None, prep=15):
+    return {
+        "name": meal, "category": cat, "protein": p, "carbs": c, "fat": f,
+        "kcal": _approx_kcal(p,c,f), "prep_min": prep, "tool": tool,
+        "notes": notes, "tags": tags or []
+    }
+
+def _gen_pool_for(lifestyle:str):
+    """Return a list of 60–90 candidate meals for a lifestyle; we’ll filter to ~50."""
+    L = []
+
+    if lifestyle == "Mediterranean Reset":
+        base = [
+            _mk("Greek yogurt, berries, honey, walnuts", 30,35,12,"Breakfast","No-Cook","Anti-inflammatory",["med"]),
+            _mk("Olive-oil egg scramble, tomato, feta, pita", 28,30,18,"Breakfast","Full","Herb + lemon",["med"]),
+            _mk("Salmon, couscous, roasted zucchini + olive oil", 42,48,18,"Dinner","Full","Lemon zest",["med","fish"]),
+            _mk("Chicken souvlaki bowl (brown rice, cucumber, tzatziki)", 40,55,12,"Lunch","Full","Tzatziki light",["med"]),
+            _mk("Tuna bean salad (olive oil, parsley, lemon) + crackers", 35,40,14,"Lunch","No-Cook","Pantry-friendly",["med","fish"]),
+            _mk("Shrimp, orzo, spinach, cherry tomato, olive oil", 38,52,14,"Dinner","Full","Add capers if you like",["med","fish"]),
+            _mk("Lentil tomato soup + whole grain bread", 24,45,8,"Lunch","Full","Garlic + oregano",["med"]),
+            _mk("Chickpea veggie bowl w/ tahini", 22,50,16,"Lunch","No-Cook","Tahini drizzle",["med","veg"]),
+            _mk("Sardine avocado toast (lemon + herbs)", 35,30,20,"Snack","No-Cook","Omega-3 boost",["med","fish"]),
+            _mk("Halloumi salad (olives, tomato, cukes) + olive oil", 26,18,20,"Lunch","Full","Grill halloumi",["med"]),
+        ]
+        # Expand variants quickly
+        for b in base:
+            L.append(b)
+            L.append({**b, "name": b["name"]+" (quinoa swap)", "carbs": b["carbs"]+10, "kcal": _approx_kcal(b["protein"], b["carbs"]+10, b["fat"])})
+            L.append({**b, "name": b["name"]+" (extra veg)", "carbs": max(10,b["carbs"]-8), "kcal": _approx_kcal(b["protein"], max(10,b["carbs"]-8), b["fat"])})
+        # Add quick/portable snacks
+        L += [
+            _mk("Cottage cheese + cherry tomatoes + olive oil", 28,12,10,"Snack","No-Cook","Salt + pepper",["med"]),
+            _mk("Hummus + veg + whole grain pita", 14,40,12,"Snack","No-Cook","Add lemon",["med","veg"])
+        ]
+
+    if lifestyle == "Pescatarian Flow":
+        base = [
+            _mk("Smoked salmon, light cream cheese, capers on whole grain", 32,34,14,"Breakfast","No-Cook","Lemon squeeze",["fish"]),
+            _mk("Shrimp stir-fry (frozen veg) over jasmine rice", 36,60,10,"Dinner","Full","Fast skillet",["fish"]),
+            _mk("Seared tuna, brown rice, sesame cukes", 42,45,12,"Dinner","Full","Soy/ginger light",["fish"]),
+            _mk("Greek yogurt + chia + mango", 28,40,8,"Breakfast","No-Cook","Chia boost",["med"]),
+            _mk("Sardine tomato pasta (olive oil + parsley)", 35,62,16,"Dinner","Full","Pantry pasta",["fish"]),
+            _mk("Canned salmon salad wrap", 38,35,14,"Lunch","No-Cook","Dijon + dill",["fish"]),
+            _mk("Miso cod + rice + steamed broccoli", 40,48,10,"Dinner","Full","Sheet pan",["fish"]),
+        ]
+        for b in base:
+            L.append(b)
+            L.append({**b, "name": b["name"]+" (low-carb swap)", "carbs": max(12,b["carbs"]-25), "fat": b["fat"]+2, "kcal": _approx_kcal(b["protein"], max(12,b["carbs"]-25), b["fat"]+2)})
+            L.append({**b, "name": b["name"]+" (15-min version)", "prep_min": 15})
+        L += [
+            _mk("Protein smoothie (whey, banana, spinach, water/ice)", 32,28,4,"Snack","No-Cook","Travel-ready",["shaker"]),
+            _mk("RTD shake + rice cup + nori", 30,40,5,"Snack","Microwave","Hotel hack",["travel"])
+        ]
+
+    if lifestyle == "Power Build":
+        base = [
+            _mk("Egg white scramble + turkey + oats", 45,45,8,"Breakfast","Full","Cinnamon in oats",["bulk"]),
+            _mk("Chicken, rice, green beans, olive oil", 45,55,12,"Lunch","Full","Staple bowl",["bulk"]),
+            _mk("Lean beef + potato + asparagus", 45,45,15,"Dinner","Full","Salt & pepper",["bulk"]),
+            _mk("Greek yogurt + whey + berries", 45,35,5,"Snack","No-Cook","Fast protein",["bulk"]),
+        ]
+        for b in base:
+            L.append(b)
+            L.append({**b, "name": b["name"]+" (extra protein)", "protein": b["protein"]+10, "kcal": _approx_kcal(b["protein"]+10, b["carbs"], b["fat"])})
+            L.append({**b, "name": b["name"]+" (lower fat)", "fat": max(3,b["fat"]-6), "kcal": _approx_kcal(b["protein"], b["carbs"], max(3,b["fat"]-6))})
+
+    if lifestyle == "Gastritis Gentle":
+        base = [
+            _mk("Overnight oats (almond milk) + banana", 18,45,8,"Breakfast","No-Cook","Low-acid",["gg"]),
+            _mk("Poached chicken + white rice + zucchini", 40,50,6,"Lunch","Full","Very gentle",["gg"]),
+            _mk("Baked cod + mashed potato + carrots", 38,45,7,"Dinner","Full","No spice",["gg"]),
+            _mk("Greek yogurt (plain) + honey", 20,25,3,"Snack","No-Cook","Small portions",["gg"]),
+            _mk("Turkey deli wrap (spinach-free) + rice crisps", 32,40,8,"Lunch","No-Cook","Light mustard",["gg"]),
+        ]
+        L += base + [ {**b, "name": b["name"]+" (microwave)", "tool":"Microwave"} for b in base ]
+
+    if lifestyle == "Low-Carb Shred":
+        base = [
+            _mk("Egg scramble + avocado + salsa", 28,12,22,"Breakfast","Full","Salsa mild",["lc"]),
+            _mk("Chicken salad (olive oil + lemon) over greens", 40,10,18,"Lunch","No-Cook","Crisp veggies",["lc"]),
+            _mk("Salmon + asparagus + butter", 42,8,20,"Dinner","Full","Lemon zest",["lc","fish"]),
+            _mk("Cottage cheese + cucumber", 28,8,6,"Snack","No-Cook","Salt/pepper",["lc"]),
+        ]
+        for b in base:
+            L.append(b)
+            L.append({**b, "name": b["name"]+" (very-low-carb)", "carbs": max(4,b["carbs"]-6), "kcal": _approx_kcal(b["protein"], max(4,b["carbs"]-6), b["fat"])})
+
+    if lifestyle == "Paleo Core":
+        base = [
+            _mk("Scrambled eggs + berries + nuts", 24,18,20,"Breakfast","Full","No grains",["paleo"]),
+            _mk("Grilled chicken + roasted sweet potato + broccoli", 42,36,10,"Lunch","Full","Olive oil",["paleo"]),
+            _mk("Beef patty + greens + olive oil + olives", 35,8,24,"Dinner","Full","No bun",["paleo"]),
+            _mk("Apple + almonds", 6,22,14,"Snack","No-Cook","Simple",["paleo"]),
+        ]
+        for b in base:
+            L.append(b)
+            L.append({**b, "name": b["name"]+" (sheet-pan quick)", "prep_min": 15})
+
+    # Guarantee enough variety
+    # If < 60 items, echo variations to reach 60–90
+    while len(L) < 60:
+        for item in list(L):
+            if len(L) >= 60: break
+            L.append({**item, "name": item["name"]+" *alt*", "prep_min": max(10, item["prep_min"]-5)})
+
+    return L
+
+def build_auto_plan(profile, training_day=True):
+    """
+    Returns a list of 3–4 meals tailored to lifestyle, dislikes/allergies, tools, time,
+    and macro targets (higher carbs on training days).
+    """
+    lifestyle = profile.get("lifestyle","Mediterranean Reset")
+    dislikes = profile.get("dislikes",[])
+    allergies = profile.get("allergies",[])
+    cap = int(profile.get("cook_time_cap",25))
+    kitchen = profile.get("kitchen_access","Full")
+    p_target = int(profile.get("protein_g", 200))
+    kcal_target = int(profile.get("cal_target", 2400)) if "cal_target" in profile else 2400
+
+    pool = _gen_pool_for(lifestyle)
+
+    # filter: dislikes/allergies, tools, time
+    filt = []
+    banned = set(x.lower() for x in (dislikes or []) + (allergies or []))
+    for m in pool:
+        name = m["name"]
+        if _contains_any(name, banned): 
+            continue
+        if not _fits_tools(m, kitchen): 
+            continue
+        if m["prep_min"] > cap: 
+            continue
+        filt.append(m)
+
+    # training day bias: allow +15–20% carbs; rest day: trim carbs
+    def adjust_for_day(m):
+        m = dict(m)
+        if training_day:
+            m["carbs"] = int(m["carbs"] * 1.15)
+        else:
+            m["carbs"] = max(8, int(m["carbs"] * 0.85))
+        m["kcal"] = _approx_kcal(m["protein"], m["carbs"], m["fat"])
+        return m
+
+    filt = [adjust_for_day(m) for m in filt]
+
+    # greedy pick: 4 meals, prioritize protein coverage, then calories
+    day = []
+    p_sum = 0; kcal_sum = 0
+    buckets = {"Breakfast":[], "Lunch":[], "Dinner":[], "Snack":[]}
+    for m in filt:
+        buckets[m["category"]].append(m)
+
+    def pick(cat, target_p_left):
+        cand = sorted(buckets.get(cat,[]), key=lambda x: (abs(x["protein"]-target_p_left), abs(x["kcal"]-kcal_target/4)))
+        return cand[0] if cand else None
+
+    # Aim for 4 touches: B/L/D + Snack
+    for cat in ["Breakfast","Lunch","Dinner","Snack"]:
+        need_p = max(0, p_target - p_sum)
+        m = pick(cat, need_p/ (1 if cat=="Snack" else 2))
+        if m:
+            day.append(m)
+            p_sum += m["protein"]; kcal_sum += m["kcal"]
+
+    # If protein still low, add one extra snack
+    if p_sum < 0.9*p_target:
+        extra = pick("Snack", p_target - p_sum)
+        if extra: 
+            day.append(extra); p_sum += extra["protein"]; kcal_sum += extra["kcal"]
+
+    # Final cap: 3–5 meals
+    return day[:5]
+
+
+
+
 def macro_adjust_if_needed():
-    """If weight is ≥5 lb below anchor, calories -5% (min 1800) and protein ≈ 0.9 g/lb. Updates anchor."""
     prof = get_kv("profile", DEFAULTS["profile"]) or DEFAULTS["profile"]
     if not prof.get("auto_macro_adjust", True):
         return None
@@ -369,9 +578,6 @@ def macro_adjust_if_needed():
         return {"cal_target": new_cal, "protein_g": new_pro, "cur": cur, "from": anchor}
     return None
 
-# ----------------------------
-# Sessions
-# ----------------------------
 def start_session_for(dt_iso, env, system, phase, day_name, start_ts=None):
     sid=uuid.uuid4().hex[:12]; ts=start_ts or datetime.datetime.now()
     exec_i("""INSERT INTO workout_sessions(session_id, dt, start_ts, env, system, phase, day_name)
@@ -393,9 +599,6 @@ def end_session(perceived_effort=7, notes="", end_ts=None):
            (e_ts.isoformat(timespec='seconds'), dur, int(perceived_effort), notes, sid))
     set_kv("active_session", None); return True
 
-# ----------------------------
-# Set Logger + PRs + Timer
-# ----------------------------
 def record_set(dt, session_id, exercise, load_lbs, reps, rpe, rest_sec, notes):
     volume=float(load_lbs)*int(reps)
     best=q("SELECT MAX(volume) AS m FROM sets_log WHERE exercise=?", (exercise,))
@@ -446,9 +649,85 @@ def popup_timer(seconds=60, sound=True):
     """
     components.html(html, height=380)
 
-# ----------------------------
-# UI HEADER
-# ----------------------------
+DIET_TYPES = ["Gastritis-Friendly","High Protein / Low Fat","Low Carb","Mediterranean","Paleo","Balanced"]
+DEFAULT_EXCLUSIONS = ["lentils"]
+
+MEAL_TEMPLATES = {
+    "Gastritis-Friendly": [
+        ("Greek Yogurt + Honey + Banana", 20, 300, "Avoid citrus; low-acid"),
+        ("Oatmeal + Whey + Blueberries", 30, 420, "Cooked oats; skip cinnamon if sensitive"),
+        ("Chicken + Rice + Zucchini", 45, 620, "Low spice"),
+        ("Salmon + Sweet Potato + Spinach", 45, 620, "Use olive oil light"),
+    ],
+    "High Protein / Low Fat": [
+        ("Egg Whites Scramble + Toast", 28, 300, "Add salsa if tolerated"),
+        ("Chicken Bowl (rice + veggies)", 55, 650, "Chipotle or home"),
+        ("Nonfat Greek Yogurt Parfait", 30, 320, "Berries + honey"),
+        ("Grilled Shrimp + Veg", 35, 450, "Lemon/garlic"),
+    ],
+    "Low Carb": [
+        ("Protein Shake + Almonds", 40, 380, "Unsweetened"),
+        ("Chicken + Greens + Olive Oil", 50, 520, "Big salad"),
+        ("Bunless Burger + Veg", 40, 600, "Lean beef or turkey"),
+        ("Egg/White Omelet + Veg", 30, 350, "Avoid heavy cheese"),
+    ],
+    "Mediterranean": [
+        ("Greek Omelet (feta, tomato)", 28, 420, "If dairy OK"),
+        ("Chicken + Quinoa + Tabbouleh", 45, 620, "Olive oil + lemon"),
+        ("Salmon + Farro + Greens", 45, 650, "Herbs"),
+        ("Yogurt + Nuts + Fruit", 25, 400, "Olive oil drizzle"),
+    ],
+    "Paleo": [
+        ("Eggs + Fruit + Nuts", 25, 550, "No grains"),
+        ("Chicken + Roasted Veg", 45, 580, "Olive oil"),
+        ("Shrimp + Cauli Rice", 40, 480, "Garlic/herbs"),
+        ("Steak + Greens + Avocado", 45, 700, "Lean cut"),
+    ],
+    "Balanced": [
+        ("Oats + Whey + Fruit", 25, 380, ""),
+        ("Chicken, Rice, Veg", 50, 650, ""),
+        ("Turkey Wrap + Fruit", 35, 520, ""),
+        ("Salmon + Sweet Potato", 45, 600, ""),
+    ],
+}
+def generate_meal_plan(diet: str, kcal_target: int, protein_target: int, dislikes: List[str], allergies: List[str]) -> List[Dict[str, Any]]:
+    pool = MEAL_TEMPLATES.get(diet, MEAL_TEMPLATES["Balanced"]).copy()
+    pool += [(name, p, k, f"Fast: {place}") for (name, p, k, _, place) in MEALS["Fast Food"]]
+    def unacceptable(name: str) -> bool:
+        low = name.lower()
+        for bad in dislikes + allergies:
+            if bad.strip() and bad.lower() in low:
+                return True
+        return False
+    filtered = [m for m in pool if not unacceptable(m[0])]
+    if not filtered: filtered = pool
+    plan = []
+    rem_p = protein_target; rem_k = kcal_target
+    filtered.sort(key=lambda x: (-x[1], x[2]))
+    for name, p, k, note in filtered:
+        if rem_p <= 0 and rem_k <= 0: break
+        if p < 20 and rem_p > 30:  # skip tiny protein entries early
+            continue
+        plan.append({"meal": name, "protein_g": p, "kcal": k, "notes": note})
+        rem_p -= p; rem_k -= k
+        if len(plan) >= 5: break
+    while len(plan) < 3 and filtered:
+        pick = filtered[len(plan) % len(filtered)]
+        plan.append({"meal": pick[0], "protein_g": pick[1], "kcal": pick[2], "notes": pick[3]})
+    return plan
+
+def ensure_sunday_basketball(date_iso: str):
+    dt = datetime.date.fromisoformat(date_iso)
+    if dt.weekday() != 6: return
+    profile = get_kv("profile", DEFAULTS["profile"]) or DEFAULTS["profile"]
+    if not profile.get("basketball_sun", True): return
+    exists = conn.execute("SELECT 1 FROM cardio_log WHERE dt=? AND mode='Basketball' LIMIT 1", (date_iso,)).fetchone()
+    if exists: return
+    exec_i("INSERT INTO cardio_log(dt, mode, minutes, details) VALUES(?,?,?,?)",
+           (date_iso, "Basketball", 180, "Auto-insert: Sunday 8–11am"))
+    try: st.toast("🏀 Auto-added Sunday Basketball 8–11am (180m)")
+    except Exception: pass
+
 st.title(f"{APP_NAME} 🔥")
 st.caption("Mobile-first • Coach Mode • 12-Month Cut")
 
@@ -458,9 +737,6 @@ active_phase_index = ["M1-3","M4-6","M7-9","M10-12"].index(phase_auto)
 st.markdown(journey_map_html(active_phase_index), unsafe_allow_html=True)
 st.caption(f"Phase: **{phase_auto}** • Suggested system: **{sys_auto}** • Auto-Phase is {'ON' if prof.get('auto_phase',True) else 'OFF'}")
 
-# ----------------------------
-# BOTTOM NAV
-# ----------------------------
 NAV_ITEMS = ["Today","Program","Meals","Trends","Instructions","Me"]
 col_nav = st.columns(len(NAV_ITEMS))
 nav = st.session_state.get("nav","Today")
@@ -469,9 +745,6 @@ for i,item in enumerate(NAV_ITEMS):
         st.session_state["nav"]=item; nav=item
 st.markdown('<div class="sticky-bottom muted">' + ' · '.join(NAV_ITEMS) + '</div>', unsafe_allow_html=True)
 
-# ----------------------------
-# PROGRAM
-# ----------------------------
 if nav=="Program":
     st.subheader("Program Loader")
     with st.expander("Auto-Phase Settings", expanded=False):
@@ -516,39 +789,14 @@ if nav=="Program":
             exec_i("DELETE FROM cardio_log WHERE dt=?", (target_date.isoformat(),))
             st.info("Cleared selected date.")
 
-# ----------------------------
-# SUNDAY HOOPS AUTO-INSERT
-# ----------------------------
-def ensure_sunday_basketball(date_iso: str):
-    """Auto-insert 8–11am basketball cardio on Sundays if enabled and not already logged."""
-    dt = datetime.date.fromisoformat(date_iso)
-    if dt.weekday() != 6:  # Monday=0 ... Sunday=6
-        return
-    profile = get_kv("profile", DEFAULTS["profile"]) or DEFAULTS["profile"]
-    if not profile.get("basketball_sun", True):
-        return
-    exists = conn.execute("SELECT 1 FROM cardio_log WHERE dt=? AND mode='Basketball' LIMIT 1", (date_iso,)).fetchone()
-    if exists:  # don't duplicate
-        return
-    exec_i("INSERT INTO cardio_log(dt, mode, minutes, details) VALUES(?,?,?,?)",
-           (date_iso, "Basketball", 180, "Auto-insert: Sunday 8–11am"))
-    try: st.toast("🏀 Auto-added Sunday Basketball 8–11am (180m)")
-    except Exception: pass
-
-# ----------------------------
-# TODAY
-# ----------------------------
 if nav=="Today":
     st.subheader("Today — Train, Log, Win")
-
-    # show targets banner
     _prof = get_kv("profile", DEFAULTS["profile"]) or DEFAULTS["profile"]
     st.caption(f"Targets → Calories: **{int(_prof.get('cal_target',2600))}** kcal • Protein: **{int(_prof.get('protein_g',220))}** g")
 
     log_date = st.date_input("Log for date", value=today())
     d_iso = log_date.isoformat()
 
-    # Sunday hoops auto-add
     ensure_sunday_basketball(d_iso)
 
     plan = q("SELECT env, system, phase, day_name FROM workout_log WHERE dt=? LIMIT 1", (d_iso,))
@@ -587,6 +835,7 @@ if nav=="Today":
         with st.expander("Coach Says", expanded=True):
             for i in ins:
                 if i["type"]=="plateau": st.info("📉 "+i["msg"])
+                elif i["type"]=="badge": st.success("🏅 "+i["msg"])
                 else: st.caption("💡 "+i["msg"])
 
     w_today = q("SELECT day_name, exercise, sets, reps, rpe, notes FROM workout_log WHERE dt=? ORDER BY rowid", (d_iso,))
@@ -599,7 +848,6 @@ if nav=="Today":
         st.markdown("### Cardio Plan")
         st.dataframe(c_today, use_container_width=True)
 
-    # Quick Set Logger
     st.markdown("### Quick Set Logger")
     rows = q("SELECT exercise FROM workout_log WHERE dt=? ORDER BY exercise", (d_iso,))
     exercises = sorted(set([str(x) for x in rows["exercise"].tolist()]))
@@ -636,7 +884,6 @@ if nav=="Today":
                         popup_timer(rest, sound=_prof.get("sound_ping", True))
     else: st.info("No exercises loaded for today.")
 
-    # Quick Logs
     st.markdown("### Quick Log")
     col1,col2,col3 = st.columns(3)
     with col1:
@@ -653,15 +900,263 @@ if nav=="Today":
     with col3: sleep = st.number_input("Sleep (h)", min_value=0.0, value=7.0, step=0.25)
     if st.button("Save Habits"): exec_i("INSERT INTO habit_log(dt, water_oz, steps, sleep_hr, notes) VALUES(?,?,?,?,?)",(d_iso, 100, steps, sleep, "PM check-in")); st.success("Habits saved")
 
+
+
 # ----------------------------
-# MEALS
+# MEALS  (replace this whole block)
+# ----------------------------
+if nav == "Meals":
+    st.subheader("Meals — Fast & On-the-Go")
+
+    prof_now = get_kv("profile", DEFAULTS["profile"]) or DEFAULTS["profile"]
+    target_cal = int(prof_now.get("cal_target", 2600))
+    target_pro = int(prof_now.get("protein_g", 220))
+
+    d_iso = today_str()
+
+    # --- AutoPlan form (executes only on submit) ---
+    with st.form("autoplan_form"):
+        st.markdown("#### Auto Meal Plan")
+        colA, colB, colC = st.columns([1, 1, 1])
+        with colA:
+            style = st.selectbox(
+                "Style",
+                ["High Protein (default)", "Gastritis-friendly", "Low Carb", "Mediterranean", "Paleo"],
+                index=0,
+            )
+        with colB:
+            day_cals = st.number_input("Calorie Budget (kcal)", 1200, 6000, target_cal, step=50)
+        with colC:
+            day_pro = st.number_input("Protein Goal (g)", 80, 350, target_pro, step=10)
+
+        excl = st.text_input("Exclude ingredients (comma-separated)", placeholder="spinach, eggs, spicy")
+        submitted = st.form_submit_button("Generate / Replace Plan", use_container_width=True)
+
+    def _excludes(name: str, excl_list: list[str]) -> bool:
+        nm = name.lower()
+        return any(x.strip().lower() in nm for x in excl_list if x.strip())
+
+    def _base_pool(style_name: str):
+        # pull from JSON if present, else fallback
+        try:
+            meals_map = json.loads((MEALS_DIR / "meals.json").read_text())
+        except Exception:
+            meals_map = MEALS
+        # very light style mapping – you can expand later
+        pool = []
+        if style_name == "Gastritis-friendly":
+            for cat in ("Home", "Fast Food", "Hotel"):
+                for m in meals_map.get(cat, []):
+                    # avoid spicy/acidic defaults
+                    if _excludes(m[0], ["spicy", "salsa", "tomato"]):
+                        continue
+                    pool.append(m)
+        elif style_name == "Low Carb":
+            for cat in meals_map:
+                for m in meals_map[cat]:
+                    if _excludes(m[0], ["rice", "bread", "wrap", "sweet potato"]):
+                        continue
+                    pool.append(m)
+        elif style_name == "Mediterranean":
+            # keep lean proteins, olive oil, fish forward
+            for cat in meals_map:
+                for m in meals_map[cat]:
+                    if "salmon" in m[0].lower() or "chicken" in m[0].lower() or "olive" in m[0].lower():
+                        pool.append(m)
+        elif style_name == "Paleo":
+            for cat in meals_map:
+                for m in meals_map[cat]:
+                    if _excludes(m[0], ["rice", "bread", "wrap", "box"]):
+                        continue
+                    pool.append(m)
+        else:  # High Protein (default)
+            for cat in meals_map:
+                for m in meals_map[cat]:
+                    if m[1] >= 30:  # protein_g
+                        pool.append(m)
+        return pool
+
+    if submitted:
+        # prevent duplicate inserts on rerun:
+        exec_i("DELETE FROM meal_log WHERE dt=? AND source='AutoPlan'", (d_iso,))
+
+        exclusions = [x.strip() for x in excl.split(",")] if excl else []
+        pool = [m for m in _base_pool(style) if not _excludes(m[0], exclusions)]
+        random.shuffle(pool)
+
+        cur_kcal = 0
+        cur_pro = 0
+        used = set()
+        # Fill to budget (±200 kcal window), prefer higher protein density first
+        pool.sort(key=lambda m: (m[1] / max(m[2], 1)), reverse=True)  # protein/kcal density
+        for m in pool:
+            name, p, k, note, src = m
+            key = (name, src)
+            if key in used:
+                continue
+            # stop when we're close to target calories
+            if cur_kcal >= day_cals - 200:
+                break
+            exec_i(
+                "INSERT INTO meal_log(dt, source, meal, protein_g, kcal, notes) VALUES(?,?,?,?,?,?)",
+                (d_iso, "AutoPlan", name, int(p), int(k), f"{note} • {style}"),
+            )
+            used.add(key)
+            cur_kcal += int(k)
+            cur_pro += int(p)
+
+        st.success(f"AutoPlan created: ~{cur_kcal} kcal, {cur_pro} g protein. You can edit or delete items below.")
+        st.rerun()
+
+    # --- Controls row ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Clear AutoPlan (today)", use_container_width=True):
+            exec_i("DELETE FROM meal_log WHERE dt=? AND source='AutoPlan'", (d_iso,))
+            st.info("Cleared AutoPlan for today.")
+            st.rerun()
+    with c2:
+        if st.button("Clear ALL meals (today)", use_container_width=True):
+            exec_i("DELETE FROM meal_log WHERE dt=?", (d_iso,))
+            st.info("Cleared all meals for today.")
+            st.rerun()
+    with c3:
+        st.caption("Tip: Use exclusions to avoid spinach/eggs/etc.")
+
+    # --- Manual add (unchanged core inputs) ---
+    st.markdown("#### Quick Add")
+    colL, colR = st.columns(2)
+    with colL:
+        try:
+            meals_map = json.loads((MEALS_DIR / "meals.json").read_text())
+        except Exception:
+            meals_map = MEALS
+        cat = st.selectbox("Category", list(meals_map.keys()))
+        names = [m[0] for m in meals_map.get(cat, [])]
+        choice = st.selectbox("Preset", names) if names else None
+        if st.button("Add Preset", use_container_width=True) and choice:
+            m = meals_map[cat][names.index(choice)]
+            exec_i(
+                "INSERT INTO meal_log(dt, source, meal, protein_g, kcal, notes) VALUES(?,?,?,?,?,?)",
+                (d_iso, m[4], m[0], int(m[1]), int(m[2]), m[3]),
+            )
+            st.success("Added meal preset")
+            st.rerun()
+    with colR:
+        st.markdown("**Custom**")
+        cname = st.text_input("Name", placeholder="Chicken bowl")
+        cprot = st.number_input("Protein (g)", 0, 200, 40)
+        ckcal = st.number_input("Calories", 0, 1500, 600)
+        csrc = st.text_input("Source/Place", placeholder="Home / Chipotle / Panda …")
+        cnote = st.text_input("Notes", placeholder="No sauce, extra veggies")
+        if st.button("Add Custom", use_container_width=True) and cname:
+            exec_i(
+                "INSERT INTO meal_log(dt, source, meal, protein_g, kcal, notes) VALUES(?,?,?,?,?,?)",
+                (d_iso, csrc or "Custom", cname, int(cprot), int(ckcal), cnote),
+            )
+            st.success("Added custom meal")
+            st.rerun()
+
+    # --- Today’s Meals table with delete buttons ---
+    st.markdown("### Today’s Meals")
+    day_meals = q(
+        "SELECT rowid, dt, source, meal, protein_g, kcal, notes FROM meal_log WHERE dt=? ORDER BY rowid DESC",
+        (d_iso,),
+    )
+    total_p = int(day_meals["protein_g"].sum()) if not day_meals.empty else 0
+    total_k = int(day_meals["kcal"].sum()) if not day_meals.empty else 0
+
+    # Totals + progress bars
+    st.markdown(
+        f"**Totals:** {total_p} g protein / {total_k} kcal  •  Targets: {target_pro} g / {target_cal} kcal"
+    )
+    st.progress(min(total_p / max(target_pro, 1), 1.0))
+    st.progress(min(total_k / max(target_cal, 1), 1.0))
+
+    if day_meals.empty:
+        st.caption("No meals logged yet.")
+    else:
+        # Render with delete per row
+        for _, r in day_meals.iterrows():
+            with st.expander(f"🧾 {r['meal']}  —  {r['protein_g']} g / {r['kcal']} kcal  ({r['source']})", expanded=False):
+                st.caption(r.get("notes") or "")
+                cols = st.columns([1, 1])
+
+                with cols[0]:
+                    if st.button("🗑️ Delete", key=f"del_{r['rowid']}"):
+                        exec_i("DELETE FROM meal_log WHERE rowid=?", (int(r["rowid"]),))
+                        st.rerun()
+                with cols[1]:
+                    st.caption(f"Logged on {r['dt']}")
+
+
+
+if nav=="Instructions":
+    st.subheader("How to Use KISS SHRED")
+    st.markdown("""
+**12-Month Flow**  
+• **M1–3:** Linear • **M4–6:** PowerBuild • **M7–9:** MetCon • **M10–12:** Athletic
+
+**Daily**  
+1) Program → **Load → TODAY**  
+2) Today → **Start Session** → train → **End Session**  
+3) Log sets with **Quick Set Logger** (PRs tracked)  
+4) Meals → use **Auto Plan** or add presets/custom
+
+**Rules**  
+Protein **0.8–1.0 g/lb** • Steps **8–12k** • Cardio 2–4×20–30 min • Sleep **7+ h**  
+Plateau 14d? **+1k steps, +15g protein, +10% cardio** for 7d.
+
+**Auto Macros**  
+When latest weigh-in is **≥ 5 lb** below last anchor:
+- Calories **−5%** (min **1800**)
+- Protein ≈ **0.9 g/lb** current
+""")
+
+# ----------------------------
+# MEALS (with AutoPlan)
 # ----------------------------
 if nav=="Meals":
     st.subheader("Meals — Fast & On-the-Go")
-    # show current targets
-    _prof = get_kv("profile", DEFAULTS["profile"]) or DEFAULTS["profile"]
-    st.caption(f"Targets → Calories: **{int(_prof.get('cal_target',2600))}** kcal • Protein: **{int(_prof.get('protein_g',220))}** g")
 
+    prof = get_kv("profile", DEFAULTS["profile"]) or DEFAULTS["profile"]
+    # Show current macro targets
+    cal_t = int(prof.get("cal_target", 2600)) if "cal_target" in prof else 2600
+    st.caption(f"Targets → Calories: **{cal_t}** kcal • Protein: **{int(prof.get('protein_g',220))}** g")
+
+    with st.expander("AutoPlan Settings", expanded=False):
+        c1,c2 = st.columns(2)
+        with c1:
+            life = st.selectbox("Lifestyle Profile", LIFESTYLES, index=LIFESTYLES.index(prof.get("lifestyle","Mediterranean Reset")))
+            cap = st.slider("Max Prep Time (min)", 5, 60, int(prof.get("cook_time_cap",25)))
+            kitchen = st.selectbox("Kitchen Access", ["Full","Microwave","No-Cook"], index=["Full","Microwave","No-Cook"].index(prof.get("kitchen_access","Full")))
+        with c2:
+            dislikes = st.text_input("Dislikes (comma-separated)", value=",".join(prof.get("dislikes",[])))
+            allergies = st.text_input("Allergies (comma-separated)", value=",".join(prof.get("allergies",[])))
+        if st.button("Save Meal Preferences"):
+            prof.update({
+                "lifestyle": life,
+                "cook_time_cap": int(cap),
+                "kitchen_access": kitchen,
+                "dislikes": [x.strip() for x in dislikes.split(",") if x.strip()],
+                "allergies": [x.strip() for x in allergies.split(",") if x.strip()],
+            })
+            set_kv("profile", prof)
+            st.success("Meal preferences saved.")
+
+    # AutoPlan generator
+    st.markdown("### Auto-Plan for Today")
+    training_day = st.toggle("Training Day (higher carbs)", value=True)
+    if st.button("Generate Today’s Meals"):
+        plan = build_auto_plan(prof, training_day=training_day)
+        d = today_str()
+        # persist to DB (append)
+        for m in plan:
+            exec_i("INSERT INTO meal_log(dt, source, meal, protein_g, kcal, notes) VALUES(?,?,?,?,?,?)",
+                   (d, prof.get("lifestyle",""), m["name"], int(m["protein"]), int(m["kcal"]), m.get("notes","")))
+        st.success(f"Auto-plan saved for {d} — {len(plan)} items added.")
+
+    # Manual presets & custom (kept from your app)
     d = today_str()
     def meals_db():
         try: return json.loads((MEALS_DIR/"meals.json").read_text())
@@ -671,15 +1166,16 @@ if nav=="Meals":
     total_p = int(day_meals["protein_g"].sum()) if not day_meals.empty else 0
     total_k = int(day_meals["kcal"].sum()) if not day_meals.empty else 0
     st.markdown(f"**Today Totals:** Protein **{total_p} g** • Calories **{total_k} kcal**")
+
     c1,c2 = st.columns(2)
     with c1:
-        cat = st.selectbox("Category", list(mdb.keys()), index=list(mdb.keys()).index("Fast Food") if "Fast Food" in mdb else 0)
-        items = mdb.get(cat, []); names=[m[0] for m in items]
-        choice = st.selectbox("Preset", names) if names else None
+        cat = st.selectbox("Category", list(mdb.keys()), index=list(mdb.keys()).index("Fast Food") if "Fast Food" in mdb else 0, key="meal_cat_select")
+        choice = st.selectbox("Preset", names, key="meal_preset_select") if names else None
         if st.button("Add Preset", use_container_width=True) and choice:
             m = items[names.index(choice)]
             exec_i("INSERT INTO meal_log(dt, source, meal, protein_g, kcal, notes) VALUES(?,?,?,?,?,?)",
                    (d, m[4], m[0], int(m[1]), int(m[2]), m[3])); st.success("Added meal preset")
+
     with c2:
         st.markdown("**Custom Meal**")
         cname = st.text_input("Name", placeholder="Chicken bowl")
@@ -690,88 +1186,23 @@ if nav=="Meals":
         if st.button("Add Custom", use_container_width=True) and cname:
             exec_i("INSERT INTO meal_log(dt, source, meal, protein_g, kcal, notes) VALUES(?,?,?,?,?,?)",
                    (d, csrc or "Custom", cname, int(cprot), int(ckcal), cnote)); st.success("Added custom meal")
+
     st.markdown("### Today’s Meals")
     day_meals = q("SELECT rowid, dt, source, meal, protein_g, kcal, notes FROM meal_log WHERE dt=? ORDER BY rowid DESC", (d,))
-    st.dataframe(day_meals, use_container_width=True)
-
-# ----------------------------
-# TRENDS (+ charts + weekly PR recap)
-# ----------------------------
-if nav=="Trends":
-    st.subheader("Trends — Progress at a Glance")
-
-    # Weight 60d line
-    since60 = (today() - datetime.timedelta(days=60)).isoformat()
-    w = q("SELECT dt, weight_lbs FROM weight_log WHERE dt>=? ORDER BY date(dt)", (since60,))
-    if not w.empty:
-        st.markdown("**Weight (last 60 days)**")
-        w2 = w.set_index("dt")["weight_lbs"]
-        st.line_chart(w2)
-        st.caption(f"Latest: **{round(w2.dropna().iloc[-1],1)} lb**") if not w2.dropna().empty else None
+    if not day_meals.empty:
+        st.dataframe(day_meals, use_container_width=True)
+        for _, r in day_meals.iterrows():
+            cols = st.columns([0.2, 0.8])
+            with cols[0]:
+                if st.button("🗑️ Delete", key=f"del_{r['rowid']}"):
+                    exec_i("DELETE FROM meal_log WHERE rowid=?", (int(r["rowid"]),))
+                    st.rerun()
+            with cols[1]:
+                st.caption(f"Logged on {r['dt']}")
     else:
-        st.caption("No weight entries yet.")
+        st.caption("No meals logged yet for today.")
 
-    # Protein 14d bars
-    since14 = (today() - datetime.timedelta(days=14)).isoformat()
-    m = q("SELECT dt, protein_g FROM meal_log WHERE dt>=?", (since14,))
-    if not m.empty:
-        st.markdown("**Daily Protein (last 14 days)**")
-        idx = [ (today()-datetime.timedelta(days=i)).isoformat() for i in range(13,-1,-1) ]
-        prot = m.groupby("dt")["protein_g"].sum().reindex(idx, fill_value=0)
-        st.bar_chart(prot)
-    else:
-        st.caption("No meals logged in the last 14 days.")
 
-    # Cardio minutes per week (8w) bars
-    since56 = (today() - datetime.timedelta(days=56)).isoformat()
-    c = q("SELECT dt, minutes FROM cardio_log WHERE dt>=?", (since56,))
-    if not c.empty:
-        st.markdown("**Cardio Minutes (last 8 weeks)**")
-        c["week"] = c["dt"].apply(lambda x: datetime.date.fromisoformat(x).isocalendar().week)
-        weekly = c.groupby("week")["minutes"].sum()
-        st.bar_chart(weekly)
-    else:
-        st.caption("No cardio logged in the last 8 weeks.")
-
-    # Weekly PR recap
-    st.markdown("### Weekly PR Recap")
-    since7 = (today() - datetime.timedelta(days=7)).isoformat()
-    prs7 = q("SELECT dt, lift, load_lbs, reps FROM pr_log WHERE dt>=? ORDER BY date(dt) DESC, load_lbs DESC", (since7,))
-    if prs7.empty:
-        st.caption("No PRs this week yet — go hunt one today 🔥")
-    else:
-        st.dataframe(prs7, use_container_width=True)
-        st.success(f"🔥 **{len(prs7)} PRs** in the last 7 days. Keep smashing!")
-
-# ----------------------------
-# INSTRUCTIONS
-# ----------------------------
-if nav=="Instructions":
-    st.subheader("How to Use KISS SHRED 2.1")
-    st.markdown("""
-**12-Month Flow**  
-• **M1–3:** Linear • **M4–6:** PowerBuild (or GVT) • **M7–9:** MetCon • **M10–12:** Athletic
-
-**Daily**  
-1) Program → **Load → TODAY**  
-2) Today → **Start Session** → train → **End Session**  
-3) Log a few sets with the **Quick Set Logger**  
-4) Meals → add fast-food preset if needed
-
-**Rules**  
-Protein **0.8–1.0 g/lb** • Steps **8–12k** • Cardio 2–4×20–30 min • Sleep **7+ h**  
-Plateau 14d? **+1k steps, +15g protein, +10% cardio** for 7d.
-
-**Auto Macros**  
-When your latest weigh-in is **≥ 5 lb** below your last anchor, the app adjusts:  
-• Calories **−5%** (never below **1800**)  
-• Protein ≈ **0.9 g/lb** current.  
-Toggle in **Me**.
-""")
-
-# ----------------------------
-# ME (Profile / Export)
-# ----------------------------
 if nav=="Me":
     st.subheader("Me — Profile & Settings")
     with st.form("profile_form"):
@@ -792,8 +1223,13 @@ if nav=="Me":
         sound_ping = st.checkbox("Timer Sound Ping", value=prof.get("sound_ping", True))
         perf = st.checkbox("Performance Mode (fast Today screen)", value=get_kv("performance_mode", True))
         basketball_sun = st.checkbox("Sunday Basketball 8–11am", value=prof.get("basketball_sun", True))
+        lifestyle = st.selectbox("Lifestyle Profile", LIFESTYLES, index=LIFESTYLES.index(prof.get("lifestyle","Mediterranean Reset")))
+        dislikes = st.text_input("Food dislikes (comma)", value=",".join(prof.get("dislikes",[])))
+        allergies = st.text_input("Allergies (comma)", value=",".join(prof.get("allergies",[])))
+        cookcap = st.slider("Max meal prep time (min)", 5, 60, int(prof.get("cook_time_cap",25)))
+        kitchen = st.selectbox("Kitchen access", ["Full","Microwave","No-Cook"], index=["Full","Microwave","No-Cook"].index(prof.get("kitchen_access","Full")))
 
-        # optional re-anchor button
+
         st.caption(f"Macro anchor: **{round(float(prof.get('macro_anchor_wt', prof.get('start_wt', 0))),1)} lb**")
         if st.form_submit_button("Save Profile"):
             prof.update({
@@ -804,7 +1240,13 @@ if nav=="Me":
                 "basketball_sun":bool(basketball_sun),"start_date":start_date.isoformat(),
                 "auto_phase":bool(auto_phase),"sound_ping":bool(sound_ping),
                 "auto_macro_adjust": bool(auto_adj),
-                "macro_anchor_wt": float(prof.get("macro_anchor_wt", start_wt))
+                "macro_anchor_wt": float(prof.get("macro_anchor_wt", start_wt)),
+                "lifestyle": lifestyle,
+                "dislikes": [x.strip() for x in dislikes.split(",") if x.strip()],
+                "allergies": [x.strip() for x in allergies.split(",") if x.strip()],
+                "cook_time_cap": int(cookcap),
+                "kitchen_access": kitchen,
+
             })
             set_kv("profile", prof); set_kv("performance_mode", bool(perf)); st.success("Saved profile & settings")
 
@@ -833,6 +1275,10 @@ if nav=="Me":
             st.warning("This deletes ALL data. Type DELETE below and press Confirm.")
             val = st.text_input("Type DELETE to confirm", key="confirm_del")
             if val=="DELETE":
-                conn.close()
-                try: os.remove(DB_FILE); st.success("Database removed. Restart the app.")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    os.remove(DB_FILE); st.success("Database removed. Restart the app.")
                 except Exception as e: st.error(f"Could not remove database: {e}")
